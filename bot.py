@@ -20,20 +20,21 @@ Configuration:
 """
 import json
 import os
+import re
+import subprocess
 import sys
 import time
 from datetime import datetime, date
 from pathlib import Path
 
 BASE_DIR = Path(__file__).parent
+TWITTER_CLI = Path.home() / "Library" / "Python" / "3.9" / "bin" / "twitter"
 TWEETS_DIR = BASE_DIR / "tweets"
 QUEUE_FILE = TWEETS_DIR / "queue.json"
 POSTED_FILE = TWEETS_DIR / "posted.json"
 ENGAGEMENT_FILE = BASE_DIR / "knowledge" / "engagement" / "engagement_log.json"
 REPLIES_FILE = BASE_DIR / "knowledge" / "engagement" / "replies.json"
 REPLY_QUEUE_FILE = TWEETS_DIR / "reply_queue.json"
-SESSION_FILE = BASE_DIR / "x_session.json"
-
 X_HANDLE = os.environ.get("X_HANDLE", "your_handle")
 
 
@@ -137,11 +138,7 @@ def approve_tweets():
 
 
 def post_tweets():
-    """Post approved tweets to X.com."""
-    if not SESSION_FILE.exists():
-        print("No session found. Run import_cookies.py first to save your X.com session.")
-        return
-
+    """Post approved tweets to X.com via twitter-cli."""
     queue = load_json(QUEUE_FILE)
     posted = load_json(POSTED_FILE)
     to_post = [t for t in queue if t["status"] == "approved" and not t.get("posted")]
@@ -150,127 +147,90 @@ def post_tweets():
         print("No approved tweets to post.")
         return
 
-    print(f"Posting {len(to_post)} tweet(s) to X.com...\n")
+    print(f"Posting {len(to_post)} tweet(s) via twitter-cli...\n")
 
-    from playwright.sync_api import sync_playwright
+    for tweet in to_post:
+        print(f"Posting tweet #{tweet['id']}: \"{tweet['text'][:60]}...\"")
 
-    with sync_playwright() as p:
-        browser = p.webkit.launch(headless=False)
-        context = browser.new_context(storage_state=str(SESSION_FILE))
-        page = context.new_page()
+        try:
+            result = subprocess.run(
+                [str(TWITTER_CLI), "post", tweet["text"]],
+                capture_output=True, text=True, timeout=30
+            )
 
-        page.goto("https://x.com/home", wait_until="domcontentloaded")
-        time.sleep(5)
+            if result.returncode != 0:
+                print(f"  Failed: {result.stderr.strip()}")
+                tweet["post_error"] = result.stderr.strip()
+                continue
 
-        if "/login" in page.url or "/flow" in page.url:
-            print("Session expired! Run import_cookies.py to re-authenticate.")
-            browser.close()
-            return
+            tweet["posted"] = True
+            tweet["posted_at"] = datetime.now().isoformat()
+            tweet["status"] = "posted"
+            posted.append(tweet)
+            print(f"  Posted!")
 
-        print("Session valid. Logged into X.com.\n")
+            # Parse tweet ID from output if available
+            output = result.stdout.strip()
+            if output:
+                tweet["post_output"] = output
 
-        for tweet in to_post:
-            print(f"Posting tweet #{tweet['id']}: \"{tweet['text'][:60]}...\"")
+            time.sleep(2)
 
-            try:
-                page.goto("https://x.com/compose/post", wait_until="domcontentloaded")
-                time.sleep(3)
+        except Exception as e:
+            print(f"  Failed to post: {e}")
+            tweet["post_error"] = str(e)
 
-                tweet_box = page.locator('[data-testid="tweetTextarea_0"]')
-                tweet_box.click()
-                time.sleep(0.5)
-                page.keyboard.type(tweet["text"], delay=10)
-                time.sleep(1)
-
-                page.locator('[data-testid="tweetButton"]').click()
-                time.sleep(3)
-
-                tweet["posted"] = True
-                tweet["posted_at"] = datetime.now().isoformat()
-                tweet["status"] = "posted"
-
-                posted.append(tweet)
-                print(f"  Posted!")
-
-                time.sleep(5)
-
-            except Exception as e:
-                print(f"  Failed to post: {e}")
-                tweet["post_error"] = str(e)
-
-        save_json(QUEUE_FILE, queue)
-        save_json(POSTED_FILE, posted)
-
-        storage = context.storage_state()
-        with open(SESSION_FILE, "w") as f:
-            json.dump(storage, f, indent=2)
-
-        browser.close()
+    save_json(QUEUE_FILE, queue)
+    save_json(POSTED_FILE, posted)
 
     print(f"\nDone. {len([t for t in to_post if t.get('posted')])} tweets posted.")
 
 
 def analyze_engagement():
-    """Scrape engagement metrics for posted tweets."""
-    if not SESSION_FILE.exists():
-        print("No session found. Run import_cookies.py first.")
+    """Scrape engagement metrics via twitter-cli."""
+    print(f"Analyzing engagement for @{X_HANDLE}...\n")
+
+    result = subprocess.run(
+        [str(TWITTER_CLI), "user-posts", X_HANDLE, "-n", "10", "--json"],
+        capture_output=True, text=True, timeout=30
+    )
+
+    if result.returncode != 0:
+        print(f"Failed to fetch tweets: {result.stderr.strip()}")
         return
 
-    posted = load_json(POSTED_FILE)
-    if not posted:
-        print("No posted tweets to analyze.")
+    try:
+        lines = result.stdout.strip().split("\n")
+        json_start = next(i for i, line in enumerate(lines) if line.strip().startswith("["))
+        raw = "\n".join(lines[json_start:])
+        tweets = json.loads(raw)
+    except (StopIteration, json.JSONDecodeError) as e:
+        print(f"Failed to parse output: {e}")
         return
 
-    print(f"Analyzing engagement for {len(posted)} posted tweets...\n")
+    engagement_data = load_json(ENGAGEMENT_FILE)
 
-    from playwright.sync_api import sync_playwright
+    for t in tweets:
+        text = t.get("text", "")
+        metrics = {
+            "reply": str(t.get("reply_count", 0)),
+            "retweet": str(t.get("retweet_count", 0)),
+            "like": str(t.get("favorite_count", 0)),
+        }
+        views = t.get("views_count", t.get("view_count", "N/A"))
 
-    with sync_playwright() as p:
-        browser = p.webkit.launch(headless=False)
-        context = browser.new_context(storage_state=str(SESSION_FILE))
-        page = context.new_page()
+        print(f"Tweet: \"{text[:60]}...\"")
+        print(f"  Replies: {metrics['reply']} | Retweets: {metrics['retweet']} | Likes: {metrics['like']} | Views: {views}")
 
-        page.goto(f"https://x.com/{X_HANDLE}", wait_until="domcontentloaded")
-        time.sleep(5)
+        engagement_data.append({
+            "text": text,
+            "metrics": metrics,
+            "views": views,
+            "scraped_at": datetime.now().isoformat(),
+        })
 
-        if "/login" in page.url:
-            print("Session expired!")
-            browser.close()
-            return
-
-        tweets = page.locator('article[data-testid="tweet"]')
-        count = tweets.count()
-        print(f"Found {count} tweets on profile.\n")
-
-        engagement_data = load_json(ENGAGEMENT_FILE)
-
-        for i in range(min(count, 10)):
-            tweet_el = tweets.nth(i)
-            try:
-                text = tweet_el.locator('[data-testid="tweetText"]').inner_text(timeout=3000)
-                metrics = {}
-                for metric in ["reply", "retweet", "like"]:
-                    try:
-                        val = tweet_el.locator(f'[data-testid="{metric}"]').inner_text(timeout=2000)
-                        metrics[metric] = val.strip() if val.strip() else "0"
-                    except Exception:
-                        metrics[metric] = "0"
-
-                print(f"Tweet: \"{text[:60]}...\"")
-                print(f"  Replies: {metrics['reply']} | Retweets: {metrics['retweet']} | Likes: {metrics['like']}")
-
-                engagement_data.append({
-                    "text": text,
-                    "metrics": metrics,
-                    "scraped_at": datetime.now().isoformat(),
-                })
-            except Exception:
-                continue
-
-        save_json(ENGAGEMENT_FILE, engagement_data)
-        print(f"\nEngagement data saved to {ENGAGEMENT_FILE}")
-
-        browser.close()
+    save_json(ENGAGEMENT_FILE, engagement_data)
+    print(f"\nEngagement data saved to {ENGAGEMENT_FILE}")
 
 
 def scrape_replies():
@@ -354,11 +314,7 @@ def approve_replies():
 
 
 def post_replies():
-    """Post approved replies to X.com."""
-    if not SESSION_FILE.exists():
-        print("No session found. Run import_cookies.py first.")
-        return
-
+    """Post approved replies to X.com via twitter-cli."""
     queue = load_json(REPLY_QUEUE_FILE)
     to_post = [r for r in queue if r["status"] == "approved" and not r.get("posted")]
 
@@ -366,81 +322,46 @@ def post_replies():
         print("No approved replies to post.")
         return
 
-    print(f"Posting {len(to_post)} reply(ies) to X.com...\n")
+    print(f"Posting {len(to_post)} reply(ies) via twitter-cli...\n")
 
-    from camoufox.sync_api import Camoufox
+    for reply in to_post:
+        print(f"Replying to: {reply['tweet_url']}")
+        print(f"  Text: \"{reply['text'][:60]}...\"")
 
-    with Camoufox(headless=False) as browser:
-        page = browser.new_page()
-        context = page.context
+        try:
+            # Extract status ID from tweet URL
+            status_match = re.search(r'/status/(\d+)', reply["tweet_url"])
+            if not status_match:
+                print(f"  Could not extract status ID from {reply['tweet_url']}")
+                continue
+            status_id = status_match.group(1)
 
-        with open(SESSION_FILE) as f:
-            storage = json.load(f)
-        for cookie in storage.get("cookies", []):
-            try:
-                context.add_cookies([cookie])
-            except Exception:
-                pass
+            result = subprocess.run(
+                [str(TWITTER_CLI), "post", reply["text"], "--reply-to", status_id],
+                capture_output=True, text=True, timeout=30
+            )
 
-        page.goto("https://x.com/home", wait_until="domcontentloaded")
-        time.sleep(5)
+            if result.returncode != 0:
+                print(f"  Failed: {result.stderr.strip()}")
+                reply["post_error"] = result.stderr.strip()
+                continue
 
-        if "/login" in page.url or "/flow" in page.url:
-            print("Session expired! Run import_cookies.py to re-authenticate.")
-            return
+            reply["posted"] = True
+            reply["posted_at"] = datetime.now().isoformat()
+            reply["status"] = "posted"
+            print(f"  Posted!")
 
-        print("Session valid.\n")
+            output = result.stdout.strip()
+            if output:
+                reply["post_output"] = output
 
-        for reply in to_post:
-            print(f"Replying to: {reply['tweet_url']}")
-            print(f"  Text: \"{reply['text'][:60]}...\"")
+            time.sleep(2)
 
-            try:
-                # Navigate to the tweet
-                page.goto(reply["tweet_url"], wait_until="domcontentloaded")
-                time.sleep(5)
+        except Exception as e:
+            print(f"  Failed to post: {e}")
+            reply["post_error"] = str(e)
 
-                # Extract status ID from reply URL and use compose endpoint
-                import re
-                status_match = re.search(r'/status/(\d+)', reply["tweet_url"])
-                if not status_match:
-                    print(f"  Could not extract status ID from {reply['tweet_url']}")
-                    continue
-                status_id = status_match.group(1)
-
-                page.goto(f"https://x.com/compose/post?reply_to={status_id}", wait_until="domcontentloaded")
-                time.sleep(3)
-
-                # Type in the compose reply box
-                reply_box = page.locator('[data-testid="tweetTextarea_0"]').first
-                reply_box.click()
-                time.sleep(0.5)
-                page.keyboard.type(reply["text"], delay=10)
-                time.sleep(2)
-
-                # Post
-                page.locator('[data-testid="tweetButton"]').first.click()
-                time.sleep(3)
-
-                reply["posted"] = True
-                reply["posted_at"] = datetime.now().isoformat()
-                reply["status"] = "posted"
-                print(f"  Posted!")
-
-                # Navigate away to reset page state before next reply
-                page.goto("https://x.com/home", wait_until="domcontentloaded")
-                time.sleep(3)
-
-            except Exception as e:
-                print(f"  Failed to post: {e}")
-                reply["post_error"] = str(e)
-
-        save_json(REPLY_QUEUE_FILE, queue)
-
-        # Update session
-        new_storage = context.storage_state()
-        with open(SESSION_FILE, "w") as f:
-            json.dump(new_storage, f, indent=2)
+    save_json(REPLY_QUEUE_FILE, queue)
 
     posted_count = len([r for r in to_post if r.get("posted")])
     print(f"\nDone. {posted_count} replies posted.")
