@@ -10,6 +10,7 @@ Usage:
   python3 bot.py status          — Show current queue status
   python3 bot.py replies         — Scrape replies to recent tweets
   python3 bot.py reply-add "text" reply_url  — Add a reply (reply_url = the tweet you're responding to)
+  python3 bot.py reply "text" reply_url      — Post a reply immediately (add + approve + post)
   python3 bot.py reply-approve   — Review and approve/reject queued replies
   python3 bot.py reply-post      — Post approved replies to X.com
   python3 bot.py reply-status    — Show reply queue status
@@ -35,7 +36,8 @@ POSTED_FILE = TWEETS_DIR / "posted.json"
 ENGAGEMENT_FILE = BASE_DIR / "knowledge" / "engagement" / "engagement_log.json"
 REPLIES_FILE = BASE_DIR / "knowledge" / "engagement" / "replies.json"
 REPLY_QUEUE_FILE = TWEETS_DIR / "reply_queue.json"
-X_HANDLE = os.environ.get("X_HANDLE", "your_handle")
+TWEET_HISTORY_FILE = BASE_DIR / "knowledge" / "content" / "tweet_history.json"
+X_HANDLE = os.environ.get("X_HANDLE", "nabotweet")
 
 
 def load_json(path, default=None):
@@ -51,6 +53,25 @@ def save_json(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def append_to_tweet_history(tweet_text):
+    """Append a posted tweet to tweet_history.json."""
+    history = load_json(TWEET_HISTORY_FILE, {"_meta": {"description": "Tweet history"}, "tweets": []})
+    if isinstance(history, list):
+        history = {"_meta": {"description": "Tweet history"}, "tweets": history}
+
+    # Simple topic extraction: first 60 chars as preview
+    preview = tweet_text[:80].strip()
+
+    history["tweets"].append({
+        "date": date.today().isoformat(),
+        "text_preview": preview,
+        "status": "posted",
+        "posted_at": datetime.now().isoformat(),
+    })
+
+    save_json(TWEET_HISTORY_FILE, history)
 
 
 def generate_tweets():
@@ -167,6 +188,7 @@ def post_tweets():
             tweet["posted_at"] = datetime.now().isoformat()
             tweet["status"] = "posted"
             posted.append(tweet)
+            append_to_tweet_history(tweet["text"])
             print(f"  Posted!")
 
             # Parse tweet ID from output if available
@@ -212,12 +234,13 @@ def analyze_engagement():
 
     for t in tweets:
         text = t.get("text", "")
+        t_metrics = t.get("metrics", {})
         metrics = {
-            "reply": str(t.get("reply_count", 0)),
-            "retweet": str(t.get("retweet_count", 0)),
-            "like": str(t.get("favorite_count", 0)),
+            "reply": str(t_metrics.get("replies", 0) if isinstance(t_metrics, dict) else t.get("reply_count", 0)),
+            "retweet": str(t_metrics.get("retweets", 0) if isinstance(t_metrics, dict) else t.get("retweet_count", 0)),
+            "like": str(t_metrics.get("likes", 0) if isinstance(t_metrics, dict) else t.get("favorite_count", 0)),
         }
-        views = t.get("views_count", t.get("view_count", "N/A"))
+        views = t_metrics.get("views", "N/A") if isinstance(t_metrics, dict) else t.get("views_count", "N/A")
 
         print(f"Tweet: \"{text[:60]}...\"")
         print(f"  Replies: {metrics['reply']} | Retweets: {metrics['retweet']} | Likes: {metrics['like']} | Views: {views}")
@@ -248,8 +271,23 @@ def scrape_replies():
     print("  Then: python3 bot.py reply-approve")
 
 
+def _looks_like_url(s):
+    """Check if a string looks like a tweet URL."""
+    return bool(re.match(r'https?://(x\.com|twitter\.com)/', s))
+
+
 def add_reply(text, tweet_url):
-    """Add a reply to the approval queue."""
+    """Add a reply to the approval queue. Auto-swaps if args are in wrong order."""
+    # Auto-detect swapped args
+    if _looks_like_url(text) and not _looks_like_url(tweet_url):
+        print("  (Auto-swapped text and URL — detected wrong arg order)")
+        text, tweet_url = tweet_url, text
+
+    if not _looks_like_url(tweet_url):
+        print(f"Error: '{tweet_url}' doesn't look like a tweet URL.")
+        print("Usage: python3 bot.py reply-add \"reply text\" https://x.com/.../status/...")
+        return
+
     queue = load_json(REPLY_QUEUE_FILE)
     reply = {
         "id": len(queue) + 1,
@@ -262,7 +300,52 @@ def add_reply(text, tweet_url):
     save_json(REPLY_QUEUE_FILE, queue)
     print(f"Reply #{reply['id']} added to queue (pending approval).")
     print(f"  To: {tweet_url}")
-    print(f"  \"{text[:80]}{'...' if len(text) > 80 else ''}\"")
+    print(f"  Text: \"{text[:80]}{'...' if len(text) > 80 else ''}\"")
+
+
+def reply_direct(text, tweet_url):
+    """Add, auto-approve, and post a reply in one step."""
+    if _looks_like_url(text) and not _looks_like_url(tweet_url):
+        text, tweet_url = tweet_url, text
+
+    if not _looks_like_url(tweet_url):
+        print(f"Error: '{tweet_url}' doesn't look like a tweet URL.")
+        return
+
+    status_match = re.search(r'/status/(\d+)', tweet_url)
+    if not status_match:
+        print(f"Could not extract status ID from {tweet_url}")
+        return
+    status_id = status_match.group(1)
+
+    print(f"Posting reply to {tweet_url}")
+    print(f"  Text: \"{text[:80]}...\"")
+
+    try:
+        result = subprocess.run(
+            [str(TWITTER_CLI), "post", text, "--reply-to", status_id],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            print(f"  Failed: {result.stderr.strip()}")
+            return
+        print(f"  Posted!")
+
+        # Also log it in reply queue for history
+        queue = load_json(REPLY_QUEUE_FILE)
+        queue.append({
+            "id": len(queue) + 1,
+            "text": text,
+            "tweet_url": tweet_url,
+            "status": "posted",
+            "posted": True,
+            "posted_at": datetime.now().isoformat(),
+            "created_at": datetime.now().isoformat(),
+        })
+        save_json(REPLY_QUEUE_FILE, queue)
+
+    except Exception as e:
+        print(f"  Failed: {e}")
 
 
 def approve_replies():
@@ -439,6 +522,12 @@ def main():
             print("Usage: python3 bot.py reply-add \"reply text\" tweet_url")
             return
         add_reply(sys.argv[2], sys.argv[3])
+    elif cmd == "reply":
+        if len(sys.argv) < 4:
+            print("Usage: python3 bot.py reply \"reply text\" tweet_url")
+            print("  Posts immediately (add + approve + post in one step)")
+            return
+        reply_direct(sys.argv[2], sys.argv[3])
     elif cmd == "reply-approve":
         approve_replies()
     elif cmd == "reply-post":
